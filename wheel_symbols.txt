@@ -1,0 +1,11 @@
+# Optional symbols to always include in daily wheel-agent recommendations.
+# The agent also includes symbols found in positions and transaction history.
+RIVN
+DDOG
+ADBE
+TSLA
+XYZ
+SHOP
+VEEV
+VGT
+NVDA
