@@ -370,6 +370,7 @@ def wheel_agent_blocked_payload(
             "rolls": [],
             "covered_calls": [],
             "cash_secured_puts": [],
+            "cash_secured_put_closest_miss": None,
             "by_account": [],
         },
         "rules": {

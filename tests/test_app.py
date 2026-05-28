@@ -266,6 +266,7 @@ def test_wheel_agent_command_returns_json_when_schwab_lookup_fails(monkeypatch, 
         "rolls": [],
         "covered_calls": [],
         "cash_secured_puts": [],
+        "cash_secured_put_closest_miss": None,
         "by_account": [],
     }
     assert "DNS failure" in payload["error"]

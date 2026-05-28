@@ -68,3 +68,6 @@ includes symbols from `wheel_symbols.txt`. By default it looks for covered
 calls with delta up to `0.35` and premium at or above `2.5%` of strike, and
 cash-secured puts with delta between `-0.25` and `0` and premium at or above
 `3%` of strike.
+
+Automation prompt text for the recurring morning run is version-controlled in
+`automation/daily-wheel-desk-prompt.md`.

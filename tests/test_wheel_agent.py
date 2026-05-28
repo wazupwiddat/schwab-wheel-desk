@@ -237,6 +237,16 @@ def test_build_wheel_recommendations_rejects_put_delta_below_negative_point_two_
     )
 
     assert result["recommendations"]["cash_secured_puts"] == []
+    assert result["recommendations"]["cash_secured_put_closest_miss"]["action"] == (
+        "CLOSEST_MISS_CASH_SECURED_PUT"
+    )
+    assert (
+        result["recommendations"]["cash_secured_put_closest_miss"]["contract"]["symbol"]
+        == "AAPL  260515P00090000"
+    )
+    assert result["recommendations"]["by_account"][0]["cash_secured_put_closest_miss"][
+        "contract"
+    ]["symbol"] == "AAPL  260515P00090000"
 
 
 def test_build_wheel_recommendations_accepts_covered_call_with_higher_delta_and_lower_premium():
@@ -370,6 +380,7 @@ def test_build_wheel_recommendations_skips_put_when_short_put_already_exists():
     )
 
     assert result["recommendations"]["cash_secured_puts"] == []
+    assert result["recommendations"]["cash_secured_put_closest_miss"] is None
 
 
 def test_build_wheel_recommendations_skips_put_when_cash_required_is_100k_or_more():
@@ -417,6 +428,34 @@ def test_build_wheel_recommendations_skips_put_when_cash_required_is_100k_or_mor
     )
 
     assert result["recommendations"]["cash_secured_puts"] == []
+    assert result["recommendations"]["cash_secured_put_closest_miss"] is None
+
+
+def test_build_wheel_recommendations_prefers_real_csp_matches_over_closest_miss():
+    accounts = [
+        account(
+            {
+                "securitiesAccount": {
+                    "accountNumber": "1234",
+                    "currentBalances": {
+                        "cashBalance": 50000,
+                        "liquidationValue": 100000,
+                    },
+                }
+            }
+        )
+    ]
+
+    result = build_wheel_recommendations(
+        accounts=accounts,
+        transactions=[],
+        option_chains={"AAPL": chain("AAPL")},
+        stored_symbols=["AAPL"],
+        as_of=date(2026, 4, 21),
+    )
+
+    assert result["recommendations"]["cash_secured_puts"][0]["action"] == "SELL_CASH_SECURED_PUT"
+    assert result["recommendations"]["cash_secured_put_closest_miss"] is None
 
 
 def test_build_wheel_recommendations_only_shows_covered_calls_for_account_with_shares():

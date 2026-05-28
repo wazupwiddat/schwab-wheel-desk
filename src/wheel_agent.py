@@ -51,7 +51,7 @@ def build_wheel_recommendations(
         as_of=as_of,
         rules=rules,
     )
-    cash_secured_puts = build_cash_secured_put_recommendations(
+    cash_secured_puts, cash_secured_put_closest_misses = build_cash_secured_put_recommendations(
         accounts=accounts,
         symbols=symbols,
         short_option_symbols_by_account=short_option_symbols_by_account,
@@ -86,10 +86,16 @@ def build_wheel_recommendations(
             "rolls": rolls,
             "covered_calls": covered_calls,
             "cash_secured_puts": cash_secured_puts,
+            "cash_secured_put_closest_miss": (
+                sorted_closest_misses(cash_secured_put_closest_misses)[0]
+                if not cash_secured_puts and cash_secured_put_closest_misses
+                else None
+            ),
             "by_account": recommendations_by_account(
                 accounts=accounts,
                 covered_calls=covered_calls,
                 cash_secured_puts=cash_secured_puts,
+                cash_secured_put_closest_misses=cash_secured_put_closest_misses,
                 rolls=rolls,
             ),
         },
@@ -375,8 +381,9 @@ def build_cash_secured_put_recommendations(
     cash_guardrails_by_account: Dict[str, Dict[str, Any]],
     as_of: date,
     rules: WheelAgentRules,
-) -> List[Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     recommendations: List[Dict[str, Any]] = []
+    closest_misses: List[Dict[str, Any]] = []
     remaining_cash_by_account = {
         account.securities_account.account_number: (
             cash_guardrails_by_account.get(account.securities_account.account_number, {}).get(
@@ -393,17 +400,15 @@ def build_cash_secured_put_recommendations(
         account_short_puts = short_option_symbols_by_account.get(account_number, {}).get(
             "PUT", set()
         )
+        account_closest_misses: List[Dict[str, Any]] = []
         for symbol in symbols:
             if symbol not in option_chains or symbol in account_short_puts:
                 continue
             underlying_price = resolve_underlying_price(option_chains[symbol])
-            eligible = [
-                contract
-                for contract in eligible_contracts(
-                    option_chains[symbol], "PUT", as_of, rules.max_dte
-                )
-                if meets_put_rule(contract, rules)
-            ]
+            all_put_contracts = eligible_contracts(
+                option_chains[symbol], "PUT", as_of, rules.max_dte
+            )
+            eligible = [contract for contract in all_put_contracts if meets_put_rule(contract, rules)]
             eligible = sorted_recommendations(
                 [
                     recommendation_row(
@@ -436,13 +441,35 @@ def build_cash_secured_put_recommendations(
                 available_cash -= collateral
                 remaining_cash_by_account[account_number] = available_cash
                 break
-    return sorted_recommendations(recommendations, action="SELL_CASH_SECURED_PUT")
+            if eligible:
+                continue
+            closest_contract = closest_put_miss_contract(
+                contracts=all_put_contracts,
+                available_cash=available_cash,
+                rules=rules,
+            )
+            if closest_contract is None:
+                continue
+            account_closest_misses.append(
+                closest_miss_row(
+                    symbol=symbol,
+                    account=account_number,
+                    contract=closest_contract,
+                    underlying_price=underlying_price,
+                    available_cash=available_cash,
+                    rules=rules,
+                )
+            )
+        if not any(row.get("account") == account_number for row in recommendations) and account_closest_misses:
+            closest_misses.append(sorted_closest_misses(account_closest_misses)[0])
+    return sorted_recommendations(recommendations, action="SELL_CASH_SECURED_PUT"), sorted_closest_misses(closest_misses)
 
 
 def recommendations_by_account(
     accounts: List[Account],
     covered_calls: List[Dict[str, Any]],
     cash_secured_puts: List[Dict[str, Any]],
+    cash_secured_put_closest_misses: List[Dict[str, Any]],
     rolls: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     by_account: List[Dict[str, Any]] = []
@@ -459,6 +486,14 @@ def recommendations_by_account(
                     for row in cash_secured_puts
                     if row.get("account") == account_number
                 ],
+                "cash_secured_put_closest_miss": next(
+                    (
+                        row
+                        for row in cash_secured_put_closest_misses
+                        if row.get("account") == account_number
+                    ),
+                    None,
+                ),
                 "rolls": [
                     row
                     for row in rolls
@@ -474,6 +509,107 @@ def contract_premium(contract: Dict[str, Any]) -> float:
     if premium is None:
         premium = contract.get("mark") or 0
     return premium or 0.0
+
+
+def put_delta_shortfall(contract: Dict[str, Any], rules: WheelAgentRules) -> float:
+    delta = contract.get("delta")
+    if delta is None:
+        return 1_000_000.0
+    if rules.min_put_delta <= delta <= 0:
+        return 0.0
+    if delta < rules.min_put_delta:
+        return rules.min_put_delta - delta
+    return delta
+
+
+def put_premium_shortfall(contract: Dict[str, Any], rules: WheelAgentRules) -> float:
+    return max(rules.min_put_premium_pct - premium_pct(contract), 0.0)
+
+
+def closest_put_miss_contract(
+    contracts: List[Dict[str, Any]],
+    available_cash: float,
+    rules: WheelAgentRules,
+) -> Optional[Dict[str, Any]]:
+    viable = []
+    for contract in contracts:
+        strike = contract.get("strike_price") or 0
+        collateral = strike * CONTRACT_MULTIPLIER
+        if (
+            collateral >= rules.max_cash_secured_put_requirement
+            or collateral > available_cash
+        ):
+            continue
+        viable.append(contract)
+    if not viable:
+        return None
+    return sorted(
+        viable,
+        key=lambda contract: (
+            0 if put_premium_shortfall(contract, rules) > 0 else 1,
+            put_premium_shortfall(contract, rules) + put_delta_shortfall(contract, rules),
+            put_premium_shortfall(contract, rules),
+            put_delta_shortfall(contract, rules),
+            contract.get("days_to_expiration")
+            if contract.get("days_to_expiration") is not None
+            else 10**9,
+            -contract_premium(contract),
+            -(contract.get("delta") if contract.get("delta") is not None else -10**9),
+        ),
+    )[0]
+
+
+def closest_miss_row(
+    symbol: str,
+    account: str,
+    contract: Dict[str, Any],
+    underlying_price: Optional[float],
+    available_cash: float,
+    rules: WheelAgentRules,
+) -> Dict[str, Any]:
+    premium_gap = put_premium_shortfall(contract, rules)
+    delta_gap = put_delta_shortfall(contract, rules)
+    reasons = []
+    if premium_gap > 0:
+        reasons.append(
+            f"premium short by {round(premium_gap * 100, 2)} percentage points"
+        )
+    if delta_gap > 0:
+        reasons.append(f"delta short by {round(delta_gap, 3)}")
+    if not reasons:
+        reasons.append("closest tradable miss")
+    return {
+        "action": "CLOSEST_MISS_CASH_SECURED_PUT",
+        "account": account,
+        "underlying": symbol,
+        "underlying_price": rounded(underlying_price),
+        "contract": contract_summary(contract),
+        "cash_required": round((contract.get("strike_price") or 0) * CONTRACT_MULTIPLIER, 2),
+        "available_cash_in_account": round(available_cash, 2),
+        "premium_pct_of_strike": rounded(premium_pct(contract), 4),
+        "delta_gap": rounded(delta_gap, 4),
+        "premium_pct_gap": rounded(premium_gap, 4),
+        "reason": "Closest miss for CSP criteria.",
+        "miss_reasons": reasons,
+    }
+
+
+def sorted_closest_misses(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            row.get("premium_pct_gap") == 0,
+            (row.get("premium_pct_gap") or 0) + (row.get("delta_gap") or 0),
+            row.get("premium_pct_gap") or 0,
+            row.get("delta_gap") or 0,
+            row.get("contract", {}).get("days_to_expiration")
+            if row.get("contract", {}).get("days_to_expiration") is not None
+            else 10**9,
+            -(row.get("contract", {}).get("bid") or 0),
+            row.get("underlying") or "",
+            row.get("account") or "",
+        ),
+    )
 
 
 def sorted_recommendations(
